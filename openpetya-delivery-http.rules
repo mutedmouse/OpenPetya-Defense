@@ -1,0 +1,284 @@
+# =============================================================================
+#  Suricata ruleset -- OpenPetya / Petya-class DELIVERY-PHASE ONLY
+# =============================================================================
+#  Author:    Andrew Quill
+#  Created:   2026-05-24
+#  Modified:  2026-05-24
+#  Version:   2.1
+#  License:   Apache-2.0
+#  TLP:       TLP:CLEAR
+#  Reference: https://github.com/iss4cf0ng/OpenPetya
+#  SID range: 9100001-9100099
+#
+#  ============================================================================
+#  READ THIS FIRST -- SCOPE LIMITATIONS
+#  ============================================================================
+#
+#  These rules do NOT detect OpenPetya running. OpenPetya generates ZERO
+#  outbound network traffic at runtime -- no C2, no propagation, no DNS,
+#  no sockets imported. See openpetya-network-gap.md for the full gap
+#  analysis and pointers to host-side coverage.
+#
+#  These rules detect ONLY the DELIVERY of OpenPetya artifacts arriving
+#  on a host over the network. They are SITUATIONAL: they fire only when
+#  one of the following is true on your sensor:
+#
+#    (A) The delivery is over PLAINTEXT HTTP  -- rare for github.com in
+#        2026. Common only for internal mirrors, lab environments, or
+#        actor-controlled staging servers that don't bother with TLS.
+#
+#    (B) Your NSM sensor performs TLS INTERCEPTION (MITM proxy with
+#        installed root CA) and re-presents decrypted bodies to Suricata
+#        via file.data. Common in enterprise outbound-inspection setups.
+#
+#    (C) You are doing RETRO-HUNT against archived full-packet capture,
+#        where any historical plaintext delivery can be replayed.
+#
+#  If none of (A)/(B)/(C) applies to your environment, this ruleset
+#  produces ZERO useful alerts and you should rely entirely on:
+#       openpetya.yar           (file scan)
+#       openpetya-sysmon.xml    (host telemetry)
+#       openpetya.sigma.yml     (EDR detection)
+#       prevention/*            (EDR prevention)
+#
+#  ============================================================================
+#  Tuning
+#  ----------------------------------------------------------------------------
+#    * SID range 9100001-9100099 is reserved for this pack.
+#    * Replace $HOME_NET / $EXTERNAL_NET with site values.
+#    * Enable file-extraction in suricata.yaml ('file-store: enabled: yes'
+#      and 'rule-files: file-extraction.rules: yes') for the carving rules.
+#    * Per-rule # Situational tags note the specific scope requirement.
+# =============================================================================
+
+
+# --- 1. URI / filename in HTTP request -- artifact name in the URI ------------
+# Situational: requires plaintext HTTP (A) or TLS-intercepting sensor (B).
+#              Will NOT fire on github.com HTTPS without TLS interception.
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"OPENPETYA Delivery: HTTP GET of OpenPetya artifact filename in URI"; \
+    flow:established,to_server; \
+    http.method; content:"GET"; \
+    http.uri; \
+    pcre:"/(?:^|\/)(OpenPetya\.exe|stage2\.bin|mbr\.bin)(?:\?|$)/i"; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0011, mitre_technique_id T1105, \
+              signature_severity Major, tlp clear, \
+              deployment_scope situational; \
+    sid:9100001; rev:3;)
+
+
+# --- 2. HTTP request to the canonical GitHub repo path ------------------------
+# Situational: requires plaintext HTTP (A) or TLS-intercepting sensor (B).
+#              github.com is TLS-only; this rule will only fire under (B)/(C).
+#              In TLS-only environments, use a DNS-RPZ block or proxy URL
+#              category block on /iss4cf0ng/OpenPetya instead.
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"OPENPETYA Delivery: GitHub repo path iss4cf0ng/OpenPetya"; \
+    flow:established,to_server; \
+    http.uri; content:"/iss4cf0ng/OpenPetya"; nocase; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0011, mitre_technique_id T1105, \
+              signature_severity Major, tlp clear, \
+              deployment_scope situational; \
+    sid:9100002; rev:3;)
+
+
+# --- 3. TLS SNI informational ------------------------------------------------
+# Situational: incident-response triage only. SNI=codeload.github.com is
+#              shared with millions of legitimate clones; this rule is
+#              DISABLED BY DEFAULT and exists only as a switch to flip
+#              during a live IR investigation of a specific host.
+#alert tls $HOME_NET any -> $EXTERNAL_NET 443 ( \
+#    msg:"OPENPETYA Recon: TLS SNI codeload.github.com (IR-mode only)"; \
+#    flow:established,to_server; \
+#    tls.sni; content:"codeload.github.com"; nocase; \
+#    classtype:misc-activity; \
+#    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+#              malware_family OpenPetya, deployment_scope ir_only, tlp clear; \
+#    sid:9100003; rev:2;)
+
+
+# --- 4. File carving: Petya-class stage2 -- STRUCTURAL (no strings) -----------
+# Situational: requires file.data visibility, i.e. plaintext HTTP (A)
+#              or TLS-intercepting sensor (B). Will NOT fire on TLS bodies.
+# Coverage: ransom-text-independent. Hits any flat binary in flight that
+#   carries the Salsa20/ChaCha20 sigma constant AND an NTFS "FILE" record
+#   magic AND a real-mode->protected-mode transition opcode AND a BIOS
+#   INT 13h LBA pattern. These four are functional necessities for any
+#   Petya-class stage2; removing any one removes capability.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Payload (v2): Petya-class stage2 carved from HTTP body \
+         (Salsa20 sigma + NTFS FILE magic + PM transition + INT13 LBA)"; \
+    flow:established,to_client; \
+    file.data; \
+    content:"expand 32-byte k"; \
+    content:"|46 49 4C 45|"; distance:0; within:65536; \
+    content:"|0F 22 C0|"; distance:0; within:65536; \
+    content:"|B4 42|"; distance:0; within:65536; \
+    pcre:"/\xB4\x42[\x00-\xFF]{1,4}\xCD\x13/"; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0040, mitre_technique_id T1561.002, \
+              signature_severity Critical, tlp clear, \
+              deployment_scope situational; \
+    sid:9100004; rev:4;)
+
+
+# --- 4b. File carving: low-fidelity string-based stage2 -- LAZY ATTACKERS ONLY
+# Situational: same as 4. Low-confidence catch for unmodified samples.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Payload (low-fidelity): unmodified ransom-text idioms"; \
+    flow:established,to_client; \
+    file.data; \
+    content:"expand 32-byte k"; \
+    content:"NiHaHaHaHa"; distance:0; within:32768; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0040, mitre_technique_id T1486, \
+              signature_severity Minor, tlp clear, \
+              deployment_scope situational; \
+    sid:9100014; rev:3;)
+
+
+# --- 5. File carving: Petya-class dropper -- IOCTL-anchored (path-agnostic) --
+# Situational: requires file.data visibility (A or B).
+# Coverage: ransom-text-independent. Anchored on IOCTL/FSCTL 32-bit
+#   immediates that any raw-disk writer MUST encode.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Dropper (v2): PE carries raw-disk IOCTL constellation + \
+         setupapi disk-interface GUID + reboot primitive"; \
+    flow:established,to_client; \
+    file.data; \
+    content:"MZ"; depth:2; \
+    content:"|A0 00 07 00|"; \
+    content:"|00 14 2D 00|"; \
+    content:"|18 00 09 00|"; \
+    pcre:"/(NtRaiseHardError|ExitWindowsEx|InitiateSystemShutdown|AdjustTokenPrivileges|SeShutdownPrivilege|NtShutdownSystem|ZwShutdownSystem|NtTerminateProcess)/"; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0040, mitre_technique_id T1561.002, \
+              signature_severity Critical, tlp clear, \
+              deployment_scope situational; \
+    sid:9100005; rev:4;)
+
+
+# --- 5b. File carving: dropper with embedded MBR-shaped blob ------------------
+# Situational: requires file.data visibility (A or B).
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Dropper (v2): PE carries embedded MBR-shaped blob"; \
+    flow:established,to_client; \
+    file.data; \
+    content:"MZ"; depth:2; \
+    content:"|BB AA 55|"; \
+    content:"|B4 42|"; distance:0; within:1024; \
+    content:"|55 AA|"; distance:0; within:8192; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0040, mitre_technique_id T1542.003, \
+              signature_severity Major, tlp clear, \
+              deployment_scope situational; \
+    sid:9100015; rev:3;)
+
+
+# --- 6. File carving: mbr.bin -- exactly 512 bytes, INT13 AH=42 pattern -------
+# Situational: requires file.data visibility (A or B).
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Payload: stage-1 MBR (mbr.bin) carved from HTTP body"; \
+    flow:established,to_client; \
+    file.data; \
+    filesize:512; \
+    content:"|55 AA|"; offset:510; depth:2; \
+    content:"|B4 42|"; \
+    content:"|CD 13|"; distance:0; within:32; \
+    content:"MBR: "; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0040, mitre_technique_id T1542.003, \
+              signature_severity Critical, tlp clear, \
+              deployment_scope situational; \
+    sid:9100006; rev:3;)
+
+
+# --- 7. Pre-filter: HTTP response whose suggested filename matches artifacts --
+# Situational: requires plaintext HTTP (A) or TLS-intercepting sensor (B).
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Delivery: Content-Disposition suggests OpenPetya artifact"; \
+    flow:established,to_client; \
+    http.header; \
+    content:"Content-Disposition"; \
+    pcre:"/Content-Disposition:[^\r\n]*filename=\"?(OpenPetya\.exe|stage2\.bin|mbr\.bin)\"?/i"; \
+    classtype:trojan-activity; \
+    reference:url,github.com/iss4cf0ng/OpenPetya; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0011, mitre_technique_id T1105, \
+              signature_severity Minor, tlp clear, \
+              deployment_scope situational; \
+    sid:9100007; rev:3;)
+
+
+# --- 8. Generic: PE arriving from a GitHub user namespace ---------------------
+# Situational: requires file.data visibility (A or B). Enrichment-only.
+alert http $EXTERNAL_NET any -> $HOME_NET any ( \
+    msg:"OPENPETYA Delivery (heuristic): PE download from /iss4cf0ng/ path"; \
+    flow:established,to_client; \
+    file.data; content:"MZ"; depth:2; \
+    flowbits:isset,iss4cf0ng_uri_seen; \
+    classtype:trojan-activity; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0011, mitre_technique_id T1105, \
+              signature_severity Informational, tlp clear, \
+              deployment_scope situational; \
+    sid:9100008; rev:3;)
+
+# Companion flowbit setter (separate rule to bind URI history to this flow):
+alert http $HOME_NET any -> $EXTERNAL_NET any ( \
+    msg:"OPENPETYA Recon: URI hit on iss4cf0ng path (flowbit setter)"; \
+    flow:established,to_server; \
+    http.uri; content:"/iss4cf0ng/"; nocase; \
+    flowbits:set,iss4cf0ng_uri_seen; \
+    flowbits:noalert; \
+    metadata: author Andrew_Quill, created_at 2026_05_24, updated_at 2026_05_24, \
+              malware_family OpenPetya, attack_target Client_Endpoint, \
+              mitre_tactic_id TA0011, mitre_technique_id T1105, \
+              signature_severity Informational, tlp clear, \
+              deployment_scope situational; \
+    sid:9100009; rev:3;)
+
+
+# --- Footer: what is NOT and CANNOT be included -------------------------------
+#
+#   * No runtime detection -- OpenPetya generates no network traffic during
+#     execution. See openpetya-network-gap.md.
+#
+#   * No SMB/EternalBlue rules -- OpenPetya has no propagation surface.
+#     If you want EternalBlue coverage (for NotPetya-style forks), enable
+#     ET OPEN sids 2024297, 2024298, 2024299, 2024430 instead.
+#
+#   * No DNS rules -- the sample makes no DNS queries.
+#
+#   * No JA3/JA3S fingerprints -- the dropper has no TLS client. GitHub
+#     delivery via a browser/git client uses that client's JA3, which is
+#     not discriminating.
+#
+#   * No C2 beacon rules -- there is no C2 in the source. If you observe
+#     beacon-like traffic from a host that just had a raw-disk-write
+#     alert, suspect a fork or co-resident malware, not OpenPetya itself.

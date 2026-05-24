@@ -1,0 +1,158 @@
+// ============================================================================
+//  OpenPetya / Petya-class MBR Locker - Microsoft Defender Advanced Hunting
+//  ============================================================================
+//  Author:    Andrew Quill
+//  Created:   2026-05-24
+//  Modified:  2026-05-24
+//  Version:   2.0
+//  License:   Apache-2.0
+//  TLP:       TLP:CLEAR
+//  Reference: https://github.com/iss4cf0ng/OpenPetya
+//  MITRE:     T1561.002, T1485, T1490, T1529, T1542.003, T1134
+//
+//  Each query is independent. Schedule the high-confidence ones as Custom
+//  Detection Rules (the schema rejects join in scheduled rules, so we use
+//  separate per-signal queries plus one correlation query for hunting).
+//
+//  Coverage map:
+//      Q1  CLI fingerprint of the dropper invocation
+//      Q2  Raw-disk handle by an untrusted image (the headline behavior)
+//      Q3  stage2/mbr blob landing on disk
+//      Q4  Behavioral kill-chain correlation: priv-adjust + raw disk + BSOD
+//      Q5  Forced shutdown via NtRaiseHardError pattern after raw disk write
+//      Q6  Cold-boot anomaly hunt (MBR change indirect signal)
+// ============================================================================
+
+
+// --- Q1: Dropper CLI fingerprint ---------------------------------------------
+//   Hits any process whose argv has the OpenPetya CLI surface. The dropper
+//   uses argv-driven dispatch, so a renamed binary is still caught.
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+       "--install", "--write-stage2", "--backup-mbr",
+       "--restore-mbr", "--bsod"
+   )
+| where ProcessCommandLine has_any ("PhysicalDrive", "stage2.bin", "mbr.bin", "--drive")
+| project Timestamp, DeviceName, AccountName, FolderPath, FileName,
+          ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine,
+          SHA256
+| extend Reason = "OpenPetya CLI fingerprint"
+
+
+// --- Q2: Raw disk handle by untrusted image (path-syntax-agnostic) -----------
+//
+//   The DeviceFileEvents.FileName field carries the kernel-canonical path,
+//   not whatever Win32 syntax the attacker used to open the handle. So
+//   matching on "\Device\Harddisk*" catches ALL of these caller-side
+//   spellings:
+//       \\.\PhysicalDrive0
+//       \\?\PhysicalDrive0
+//       \??\PhysicalDrive0
+//       \\.\GLOBALROOT\Device\Harddisk0\DR0
+//       \Device\Harddisk0\DR0     (NtCreateFile direct)
+//       \\.\Volume{GUID}          -> \Device\HarddiskVolume*
+//       \\.\C:                    -> \Device\HarddiskVolume*
+//       SetupDiGetDeviceInterfaceDetail() interface path
+//   This is the LOAD-BEARING detection for OpenPetya and the entire
+//   MBR-locker class. It cannot be defeated by spelling the path
+//   differently in user-mode.
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName startswith @"\Device\Harddisk"            // canonical: all disk paths land here
+   or   FileName has        @"\\.\PhysicalDrive"            // belt-and-braces (rare APIs)
+   or   FileName has        @"\\?\PhysicalDrive"
+   or   FileName has        @"\??\PhysicalDrive"
+   or   FileName has        @"\\.\GLOBALROOT\Device\Harddisk"
+| where InitiatingProcessFolderPath !in (
+        @"c:\windows\system32\",
+        @"c:\windows\syswow64\",
+        @"c:\program files\windows defender\",
+        @"c:\programdata\microsoft\windows defender\platform\"
+   )
+| where InitiatingProcessFileName !in~ (
+        "defrag.exe", "chkdsk.exe", "vds.exe", "vdsldr.exe", "vssvc.exe",
+        "diskpart.exe", "fsutil.exe", "MsMpEng.exe", "drvinst.exe",
+        "MpCmdRun.exe", "WerFault.exe", "smartctl.exe"
+   )
+| project Timestamp, DeviceName, AccountName, FileName, ActionType,
+          InitiatingProcessFolderPath, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, InitiatingProcessSHA256
+| extend Reason = "Raw disk write by untrusted image (kernel-canonical path)"
+
+
+// --- Q3: stage2.bin / mbr.bin landing on disk --------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileRenamed")
+| where FileName in~ ("stage2.bin", "mbr.bin", "OpenPetya.exe")
+   or  FileName endswith ".bin" and FolderPath has_any (@"\Downloads\", @"\Temp\", @"\ProgramData\")
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath,
+          SHA256, MD5, InitiatingProcessFileName, InitiatingProcessCommandLine
+| extend Reason = "OpenPetya artifact filename observed"
+
+
+// --- Q4: Behavioral kill-chain correlation -----------------------------------
+//   Same device, same initiator within a 10-minute window:
+//     (a) opens \\.\PhysicalDrive
+//     (b) calls NtRaiseHardError (surfaces as Event 6008 in System log)
+//   Use this as a HUNT query (the join is not allowed in scheduled detection).
+let RawDiskHandles =
+    DeviceFileEvents
+    | where Timestamp > ago(7d)
+    | where FileName startswith "\\Device\\Harddisk" or FileName has @"\\.\PhysicalDrive"
+    | project RawTime=Timestamp, DeviceId, DeviceName,
+              RawProc=InitiatingProcessFileName,
+              RawSHA=InitiatingProcessSHA256,
+              RawCmd=InitiatingProcessCommandLine;
+let ForcedShutdowns =
+    DeviceEvents
+    | where Timestamp > ago(7d)
+    | where ActionType in ("PowerStateChanged", "OsShutdown", "UnexpectedShutdown")
+        or AdditionalFields has_any ("STATUS_ASSERTION_FAILURE", "0xC0000420",
+                                     "BUGCHECK", "NtRaiseHardError");
+RawDiskHandles
+| join kind=inner ForcedShutdowns on DeviceId
+| where Timestamp between (RawTime .. (RawTime + 10m))
+| project RawTime, ShutdownTime=Timestamp, DeviceName, RawProc, RawSHA, RawCmd, ActionType
+| extend Reason = "PhysicalDrive write followed by forced/abnormal shutdown <= 10m"
+
+
+// --- Q5: NtRaiseHardError pattern via Event 6008 / Bugcheck ------------------
+//   When the dropper triggers BSOD, Windows logs:
+//     System log EventID 1001 (Bugcheck) and EventID 6008 (unexpected
+//     shutdown). MDE forwards these as DeviceEvents.
+//   The bugcheck code from STATUS_ASSERTION_FAILURE -> 0x7E (typical) or
+//   a custom code depending on Windows build. We don't pin the code.
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("UnexpectedShutdown", "PowerStateChanged")
+| join kind=inner (
+       DeviceFileEvents
+       | where Timestamp > ago(7d)
+       | where FileName has @"\\.\PhysicalDrive" or FileName startswith "\\Device\\Harddisk"
+       | project DeviceId, RawDiskTime=Timestamp, RawProcess=InitiatingProcessFileName
+   ) on DeviceId
+| where Timestamp - RawDiskTime between (0s .. 15m)
+| project Timestamp, DeviceName, ActionType, RawDiskTime, RawProcess
+| extend Reason = "BSOD/forced shutdown after raw-disk write (Petya-class)"
+
+
+// --- Q6: Cold-boot anomaly / boot order changes hunt -------------------------
+//   Many endpoints register boot configuration via bcdedit. A bcdedit hint
+//   immediately preceded by raw-disk writes is suspicious. (OpenPetya does
+//   NOT use bcdedit, but Petya-class forks commonly do. Defensive bonus.)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "bcdedit.exe"
+| where ProcessCommandLine has_any ("/set", "/create", "/copy", "/deletevalue")
+| join kind=inner (
+       DeviceFileEvents
+       | where Timestamp > ago(7d)
+       | where FileName has @"\\.\PhysicalDrive" or FileName startswith "\\Device\\Harddisk"
+       | project DeviceId, RawTime=Timestamp, RawCmd=InitiatingProcessCommandLine
+   ) on DeviceId
+| where Timestamp between (RawTime .. (RawTime + 1h))
+| project Timestamp, DeviceName, ProcessCommandLine, RawTime, RawCmd
+| extend Reason = "bcdedit modification near raw-disk write"

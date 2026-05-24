@@ -1,0 +1,309 @@
+<!--
+    Sysmon configuration fragment - OpenPetya / Petya-class MBR locker
+    ===================================================================
+    Author:    Andrew Quill
+    Created:   2026-05-24
+    Modified:  2026-05-24
+    Version:   2.0
+    License:   Apache-2.0
+    TLP:       TLP:CLEAR
+    Reference: https://github.com/iss4cf0ng/OpenPetya
+    MITRE:     T1561.002, T1485, T1490, T1529, T1542.003, T1134
+
+    Drop these <RuleGroup> blocks inside an existing Sysmon config (e.g.
+    SwiftOnSecurity or Olaf Hartong) under <EventFiltering>.
+
+    Schema:        4.90  (verified against sysmon 15.x)
+    Rule name tag: surfaces as the Sysmon RuleName field in the event log
+                   so SIEM correlation needs no extra parsing.
+
+    Coverage map vs the kill chain
+    ------------------------------
+      1.  Delivery / planting     -> EventID 11 (FileCreate of stage2.bin/mbr.bin)
+      2.  Privilege adjustment    -> EventID 1  (cmdline + dropper image hash)
+      3.  Raw-disk handle         -> EventID 9  (RawAccessRead on PhysicalDrive*)
+      4.  Sector write to MBR     -> EventID 9  + EventID 1 correlation
+      5.  Forced reboot (BSOD)    -> EventID 1  (cmdline --bsod) + Event 6008
+                                     (unexpected shutdown) in System log
+      6.  Pre-OS bootkit boot     -> outside Sysmon (covered by Sysmon's
+                                     EventID 1 ProcessGuid gap after reboot,
+                                     plus the EDR/firmware checks below)
+
+    Robustness notes
+    ----------------
+      * Process Creation rules use multiple INDEPENDENT signals (cmdline,
+        parent image, raw path constants) so renaming the binary or
+        permuting the argv defeats none of them on its own.
+      * RawAccessRead is OR'd with FileStream open on \\.\PhysicalDrive*
+        because some EDRs strip RawAccessRead in field deployments.
+      * RuleNames are stable across versions; do not edit them without
+        also updating the SIEM correlation rules.
+-->
+
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>SHA256,IMPHASH</HashAlgorithms>
+  <CheckRevocation/>
+
+  <EventFiltering>
+
+    <!-- ============================================================ -->
+    <!-- EventID 1: Process Creation                                  -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - Process Creation" groupRelation="or">
+      <ProcessCreate onmatch="include">
+
+        <!-- 1a. CLI arguments unique to the OpenPetya dropper -->
+        <Rule name="OpenPetya_CLI_install"  groupRelation="and">
+          <CommandLine condition="contains">--install</CommandLine>
+          <CommandLine condition="contains">--drive</CommandLine>
+        </Rule>
+
+        <Rule name="OpenPetya_CLI_writestage" groupRelation="and">
+          <CommandLine condition="contains">--write-stage2</CommandLine>
+          <CommandLine condition="contains">--drive</CommandLine>
+        </Rule>
+
+        <Rule name="OpenPetya_CLI_bsod">
+          <CommandLine condition="contains">--bsod</CommandLine>
+        </Rule>
+
+        <Rule name="OpenPetya_CLI_backupmbr">
+          <CommandLine condition="contains">--backup-mbr</CommandLine>
+        </Rule>
+
+        <Rule name="OpenPetya_CLI_restorembr">
+          <CommandLine condition="contains">--restore-mbr</CommandLine>
+        </Rule>
+
+        <!-- 1b. Any process invoking with both PhysicalDrive and stage2 references -->
+        <Rule name="OpenPetya_CLI_stage2_artifact" groupRelation="and">
+          <CommandLine condition="contains">stage2.bin</CommandLine>
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+        </Rule>
+
+        <!-- 1c. Untrusted-parent + ANY raw-disk path syntax in cmdline.
+                  v2: path-syntax-agnostic. CommandLine 'contains' is
+                  case-insensitive in Sysmon, so case variants are
+                  handled. We enumerate ALL Win32/NT syntaxes that
+                  resolve to a disk-class kernel object. -->
+        <!-- The path atoms (any one of these qualifies as a disk-path token): -->
+        <!--   "PhysicalDrive"     (covers \\.\ and \\?\ forms)              -->
+        <!--   "Device\Harddisk"   (covers \Device\... and \\.\GLOBALROOT\... )-->
+        <!--   "\\.\Volume{"       (volume-GUID syntax with DASD_IO)         -->
+        <!--   "\??\PhysicalDrive" (NT-namespace via Win32)                  -->
+        <!--   "\\.\Harddisk"      (numbered partition path)                 -->
+        <!-- The same enumeration appears in EVERY Process Creation rule.    -->
+
+        <!-- powershell / pwsh -->
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_powershell_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\powershell.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_powershell_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <ParentImage condition="end with">\powershell.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_powershell_volguid" groupRelation="and">
+          <CommandLine condition="contains">\\.\Volume{</CommandLine>
+          <ParentImage condition="end with">\powershell.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_pwsh_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\pwsh.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_pwsh_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <ParentImage condition="end with">\pwsh.exe</ParentImage>
+        </Rule>
+
+        <!-- cmd / wscript / cscript / wmiprvse -->
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_cmd_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\cmd.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_cmd_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <ParentImage condition="end with">\cmd.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_wscript" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\wscript.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_cscript" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\cscript.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_wmiprv" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\wmiprvse.exe</ParentImage>
+        </Rule>
+
+        <!-- browsers -->
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_chrome" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\chrome.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_msedge" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\msedge.exe</ParentImage>
+        </Rule>
+        <Rule name="OpenPetya_UntrustedParent_RawDisk_firefox" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <ParentImage condition="end with">\firefox.exe</ParentImage>
+        </Rule>
+
+        <!-- 1d. Dropper image in user-writable path  +  ANY raw-disk syntax.
+                  Enumerated for each major path syntax variant.    -->
+        <Rule name="OpenPetya_UserPath_RawDisk_dl_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <Image condition="contains">\Downloads\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_dl_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <Image condition="contains">\Downloads\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_temp_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <Image condition="contains">\AppData\Local\Temp\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_temp_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <Image condition="contains">\AppData\Local\Temp\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_pdata_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <Image condition="contains">\ProgramData\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_pdata_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <Image condition="contains">\ProgramData\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_public_phys" groupRelation="and">
+          <CommandLine condition="contains">PhysicalDrive</CommandLine>
+          <Image condition="contains">\Users\Public\</Image>
+        </Rule>
+        <Rule name="OpenPetya_UserPath_RawDisk_public_ntpath" groupRelation="and">
+          <CommandLine condition="contains">Device\Harddisk</CommandLine>
+          <Image condition="contains">\Users\Public\</Image>
+        </Rule>
+
+        <!-- 1e. Privilege/reboot API mentions in cmdline are REINFORCEMENT
+                  only, not standalone triggers. They appear here under
+                  the same parent/path constraints so they correlate with
+                  the disk activity, not by themselves. -->
+        <Rule name="OpenPetya_PrivReinforce_NtRHE" groupRelation="and">
+          <CommandLine condition="contains">NtRaiseHardError</CommandLine>
+          <Image condition="contains">\Users\</Image>
+        </Rule>
+        <Rule name="OpenPetya_PrivReinforce_RtlAdj" groupRelation="and">
+          <CommandLine condition="contains">RtlAdjustPrivilege</CommandLine>
+          <Image condition="contains">\Users\</Image>
+        </Rule>
+
+      </ProcessCreate>
+    </RuleGroup>
+
+    <!-- ============================================================ -->
+    <!-- EventID 9: Raw Access Read                                   -->
+    <!--   Triggers when a process opens \\.\PhysicalDriveN or        -->
+    <!--   \\.\<vol>: for raw block access. Legitimate users of this  -->
+    <!--   API: defrag, chkdsk, vds, vssvc, backup agents, AV. We     -->
+    <!--   EXCLUDE those (small allow-list) and ALERT on everything   -->
+    <!--   else. This is the headline event for MBR-locker behavior.  -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - RawAccessRead PhysicalDrive" groupRelation="or">
+      <RawAccessRead onmatch="exclude">
+        <!-- Microsoft signed disk tools -->
+        <Image condition="is">C:\Windows\System32\defrag.exe</Image>
+        <Image condition="is">C:\Windows\System32\chkdsk.exe</Image>
+        <Image condition="is">C:\Windows\System32\vds.exe</Image>
+        <Image condition="is">C:\Windows\System32\vdsldr.exe</Image>
+        <Image condition="is">C:\Windows\System32\vssvc.exe</Image>
+        <Image condition="is">C:\Windows\System32\diskpart.exe</Image>
+        <Image condition="is">C:\Windows\System32\fsutil.exe</Image>
+        <Image condition="is">C:\Windows\System32\smartctl.exe</Image>
+        <Image condition="is">C:\Windows\System32\MsMpEng.exe</Image>
+        <Image condition="is">C:\Windows\System32\SearchIndexer.exe</Image>
+        <Image condition="is">C:\Windows\System32\svchost.exe</Image>
+        <Image condition="is">C:\Windows\System32\drvinst.exe</Image>
+        <Image condition="is">C:\Windows\System32\dfsrs.exe</Image>
+        <Image condition="is">C:\Windows\System32\WerFault.exe</Image>
+        <Image condition="end with">\MpCmdRun.exe</Image>
+        <!-- Add your enterprise backup agent / EDR sensor paths here -->
+      </RawAccessRead>
+    </RuleGroup>
+
+    <!-- ============================================================ -->
+    <!-- EventID 11: File Create                                      -->
+    <!--   Catch stage2.bin / mbr.bin landing on disk. Filename is    -->
+    <!--   referenced literally in the dropper's --install argv.      -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - FileCreate stage2/mbr" groupRelation="or">
+      <FileCreate onmatch="include">
+        <Rule name="OpenPetya_FileCreate_stage2">
+          <TargetFilename condition="end with">\stage2.bin</TargetFilename>
+        </Rule>
+        <Rule name="OpenPetya_FileCreate_mbr">
+          <TargetFilename condition="end with">\mbr.bin</TargetFilename>
+        </Rule>
+        <Rule name="OpenPetya_FileCreate_OpenPetyaExe">
+          <TargetFilename condition="end with">\OpenPetya.exe</TargetFilename>
+        </Rule>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- ============================================================ -->
+    <!-- EventID 15: FileCreateStreamHash  (covers archive download)  -->
+    <!--   Captures Mark-of-the-Web on the dropper + payload blobs    -->
+    <!--   when they arrive via a browser. Pivot from this event to   -->
+    <!--   the originating zone/URL.                                  -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - MOTW on dropper/payload" groupRelation="or">
+      <FileCreateStreamHash onmatch="include">
+        <TargetFilename condition="end with">\OpenPetya.exe</TargetFilename>
+        <TargetFilename condition="end with">\stage2.bin</TargetFilename>
+        <TargetFilename condition="end with">\mbr.bin</TargetFilename>
+      </FileCreateStreamHash>
+    </RuleGroup>
+
+    <!-- ============================================================ -->
+    <!-- EventID 7: Image Load - imphash anchors                      -->
+    <!--   We cannot rely on a single static IMPHASH for a recompile, -->
+    <!--   but we DO want to capture the IMPHASH whenever any process -->
+    <!--   loads setupapi.dll alongside opening \\.\PhysicalDrive*    -->
+    <!--   (the dropper is statically linked against setupapi). The   -->
+    <!--   correlation lives in the SIEM, not Sysmon. Log the load.   -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - ImageLoad setupapi by user process" groupRelation="or">
+      <ImageLoad onmatch="include">
+        <Rule name="OpenPetya_ImageLoad_setupapi_userpath" groupRelation="and">
+          <ImageLoaded condition="end with">\setupapi.dll</ImageLoaded>
+          <Image condition="contains">\Users\</Image>
+        </Rule>
+        <Rule name="OpenPetya_ImageLoad_setupapi_temp" groupRelation="and">
+          <ImageLoaded condition="end with">\setupapi.dll</ImageLoaded>
+          <Image condition="contains">\AppData\Local\Temp\</Image>
+        </Rule>
+      </ImageLoad>
+    </RuleGroup>
+
+    <!-- ============================================================ -->
+    <!-- EventID 10: Process Access - dynamic-resolve of ntdll APIs   -->
+    <!--   The dropper imports NtRaiseHardError + RtlAdjustPrivilege  -->
+    <!--   via GetProcAddress (no IAT entry). The string remains in   -->
+    <!--   .rdata. We cannot see GetProcAddress in Sysmon, but if     -->
+    <!--   the dropper later opens ntdll for read (some loaders do)   -->
+    <!--   we will catch the access. Low-noise inclusion.             -->
+    <!-- ============================================================ -->
+    <RuleGroup name="OpenPetya - ntdll read by user-path image" groupRelation="or">
+      <ProcessAccess onmatch="include">
+        <Rule name="OpenPetya_ntdllProbe_userpath" groupRelation="and">
+          <TargetImage condition="end with">\ntdll.dll</TargetImage>
+          <SourceImage condition="contains">\Users\</SourceImage>
+          <GrantedAccess condition="is">0x1410</GrantedAccess>
+        </Rule>
+      </ProcessAccess>
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>

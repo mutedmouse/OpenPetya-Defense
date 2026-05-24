@@ -1,0 +1,178 @@
+# =============================================================================
+# Sigma rule pack - OpenPetya / Petya-class MBR locker
+# =============================================================================
+# Ships three rules in one document. Convert with sigmac/pySigma to the
+# backend your SIEM/EDR uses (splunk, elastic-eql, microsoft-defender,
+# crowdstrike-eam, sentinelone, qradar, devo, etc).
+#
+# Rule 1 - CLI fingerprint               (high precision)
+# Rule 2 - Raw-disk handle by untrusted  (high precision, behavior-based)
+# Rule 3 - Petya-class kill-chain combo  (medium-high, multi-signal)
+# =============================================================================
+
+---
+title: OpenPetya Dropper CLI Fingerprint
+id: 6f7e1d4b-1c5f-4d11-9f7a-1f5f4d2c1e0a
+status: experimental
+description: >
+    Detects the OpenPetya user-mode installer being invoked with any of its
+    distinctive command-line switches. Catches renamed binaries because the
+    argv vocabulary is fixed by the source.
+references:
+    - https://github.com/iss4cf0ng/OpenPetya
+author: Andrew Quill
+license: Apache-2.0
+tlp: TLP:CLEAR
+date: 2026/05/24
+tags:
+    - attack.impact
+    - attack.t1561.002      # Disk Structure Wipe
+    - attack.t1485          # Data Destruction
+    - attack.t1490          # Inhibit System Recovery
+    - attack.t1529          # System Shutdown/Reboot
+    - attack.t1134          # Access Token Manipulation
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    install_combo:
+        CommandLine|contains|all:
+            - '--install'
+            - '--drive'
+    write_combo:
+        CommandLine|contains|all:
+            - '--write-stage2'
+            - '--drive'
+    backup_combo:
+        CommandLine|contains:
+            - '--backup-mbr'
+            - '--restore-mbr'
+    bsod_flag:
+        CommandLine|contains: '--bsod'
+    artifact_combo:
+        CommandLine|contains|all:
+            - 'stage2.bin'
+            - 'PhysicalDrive'
+    condition: 1 of (install_combo, write_combo, backup_combo, bsod_flag, artifact_combo)
+falsepositives:
+    - Authorized red-team / detection-engineering exercises using the
+      published OpenPetya PoC. Suppress per device or per analyst account.
+level: high
+
+---
+title: Raw Physical Drive Write by Untrusted Image (Petya/Bootkit Pattern)
+id: 8b32e9c0-fc0b-4f44-9e62-aaa0d4f29d1f
+status: experimental
+description: >
+    Generic detection of any non-allowlisted user-mode process obtaining a
+    write handle to \\.\PhysicalDrive*. This is the load-bearing primitive
+    for OpenPetya, GoldenEye, NotPetya, Petya, KillDisk, HermeticWiper, and
+    most boot-sector wipers. The allowlist is small and stable.
+references:
+    - https://github.com/iss4cf0ng/OpenPetya
+    - https://learn.microsoft.com/windows/win32/fileio/file-buffering
+author: Andrew Quill
+license: Apache-2.0
+tlp: TLP:CLEAR
+date: 2026/05/24
+tags:
+    - attack.impact
+    - attack.t1561
+    - attack.t1561.002
+    - attack.t1485
+logsource:
+    category: file_event
+    product: windows
+detection:
+    # Path-syntax-agnostic: the SIEM canonicalises caller paths to the
+    # kernel form '\Device\Harddisk*' regardless of which Win32 spelling
+    # the attacker used (\\.\PhysicalDrive*, \\?\PhysicalDrive*,
+    # \\.\GLOBALROOT\Device\Harddisk*, \\.\Volume{GUID}, SetupApi
+    # interface path, NtCreateFile direct, etc.). The Win32-spelling
+    # atoms below are belt-and-braces for SIEMs that surface the
+    # caller-side string instead of the kernel canonical name.
+    raw_disk_write:
+        TargetFilename|startswith:
+            - '\Device\Harddisk'
+            - '\Device\HarddiskVolume'
+            - '\\.\PhysicalDrive'
+            - '\\?\PhysicalDrive'
+            - '\??\PhysicalDrive'
+            - '\\.\GLOBALROOT\Device\Harddisk'
+            - '\\.\Volume{'
+    trusted_initiator:
+        Image|endswith:
+            - '\defrag.exe'
+            - '\chkdsk.exe'
+            - '\diskpart.exe'
+            - '\fsutil.exe'
+            - '\vds.exe'
+            - '\vdsldr.exe'
+            - '\vssvc.exe'
+            - '\MsMpEng.exe'
+            - '\MpCmdRun.exe'
+            - '\drvinst.exe'
+            - '\WerFault.exe'
+            - '\smartctl.exe'
+    trusted_path:
+        Image|startswith:
+            - 'C:\Windows\System32\'
+            - 'C:\Windows\SysWOW64\'
+            - 'C:\Program Files\Windows Defender\'
+            - 'C:\ProgramData\Microsoft\Windows Defender\Platform\'
+    condition: raw_disk_write and not (trusted_initiator and trusted_path)
+falsepositives:
+    - Enterprise backup agents (Veeam, CommVault) and EDR sensors. Add
+      their canonical install paths to trusted_path.
+    - Disk imaging tools (clonezilla, Macrium) used by IT. Add to allowlist
+      with full path + signer enrichment if available.
+level: critical
+
+---
+title: Petya-class Kill-Chain - Raw Disk Write Followed by Forced Reboot
+id: c1aa7d9d-2e16-4c2b-9c9e-fa7d5b3aa1c2
+status: experimental
+description: >
+    Correlates a raw-disk write by an untrusted image with a forced
+    shutdown or bugcheck within 15 minutes on the same host. This is the
+    behavioural signature of OpenPetya's NtRaiseHardError -> stage-2
+    boot flow, and matches NotPetya/GoldenEye/PetWrap/KillDisk family
+    behavior. Designed to be SIEM-side (correlation rule).
+references:
+    - https://github.com/iss4cf0ng/OpenPetya
+author: Andrew Quill
+license: Apache-2.0
+tlp: TLP:CLEAR
+date: 2026/05/24
+tags:
+    - attack.impact
+    - attack.t1561.002
+    - attack.t1529
+logsource:
+    product: windows
+    service: correlation
+detection:
+    # NOTE: encoded for engines that support 'temporal'/'sequence' Sigma
+    # extensions (Splunk, Elastic, Devo, Chronicle). For engines that do
+    # not, implement equivalent as a saved correlation search.
+    raw_disk_write:
+        category: file_event
+        TargetFilename|startswith:
+            - '\Device\Harddisk'
+            - '\\.\PhysicalDrive'
+    forced_reboot:
+        category: system
+        EventID:
+            - 1001    # Windows Error Reporting bucket: BlueScreen
+            - 6008    # Unexpected shutdown
+            - 41      # Kernel-Power: system rebooted w/o cleanly shutting down
+    condition: |
+        sequence by host.id
+            [ raw_disk_write ] as a
+            [ forced_reboot   ] as b
+            where b.@timestamp - a.@timestamp <= 15m
+              and not a.Image|startswith 'C:\Windows\System32\'
+falsepositives:
+    - A buggy disk driver crashing the host shortly after a legitimate
+      disk operation. Tune by host role and by signed/unsigned initiator.
+level: critical
