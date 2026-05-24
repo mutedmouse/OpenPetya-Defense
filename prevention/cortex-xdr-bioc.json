@@ -1,0 +1,82 @@
+{
+  "metadata": {
+    "author":    "Andrew Quill",
+    "created":   "2026-05-24",
+    "modified":  "2026-05-24",
+    "version":   "2.0",
+    "license":   "Apache-2.0",
+    "tlp":       "TLP:CLEAR",
+    "reference": "https://github.com/iss4cf0ng/OpenPetya",
+    "mitre":     ["T1561.002", "T1485", "T1490", "T1529", "T1134", "T1542.003"]
+  },
+  "_comment": [
+    "Palo Alto Cortex XDR -- Behavioral IOC (BIOC) Prevention Rules",
+    "==================================================================",
+    "Import via:",
+    "  Endpoints -> Endpoint Configuration -> Profiles -> ",
+    "    Restrictions Profile -> Behavioral IOC -> Import",
+    "or via the BIOC API:",
+    "  POST /public_api/v1/bioc/insert_rule/",
+    "",
+    "Each rule below uses Cortex XQL with `behavior: PREVENTION` to",
+    "block. Set `behavior: DETECTION` initially for tuning.",
+    "",
+    "Adversarial-defeat notes",
+    "------------------------",
+    "NAIVE v1: filter action_file_path contains \"\\\\.\\\\PhysicalDrive\"",
+    "         Generic: matches every legitimate disk tool, gets exempted.",
+    "HARDENED v2 (below): conjunction of (disk-class kernel path) AND",
+    "         (actor not Microsoft-signed) AND (actor in user path)",
+    "         AND (actor low-prevalence)."
+  ],
+
+  "rules": [
+    {
+      "name": "Petya-Class: Raw-disk write by untrusted actor",
+      "severity": "HIGH",
+      "category": "Petya-class MBR-locker prevention",
+      "mitre_techniques": ["T1561.002","T1485","T1490","T1529"],
+      "behavior": "PREVENTION",
+      "query": "dataset = xdr_data | filter event_type = ENUM.FILE and event_sub_type in (ENUM.FILE_CREATE_NEW, ENUM.FILE_WRITE, ENUM.FILE_OPEN_FOR_WRITE) and (action_file_path ~= \"^\\\\\\\\Device\\\\\\\\Harddisk\" or action_file_path ~= \"^\\\\\\\\\\\\?\\\\\\\\PhysicalDrive\" or action_file_path ~= \"^\\\\\\\\\\\\.\\\\\\\\PhysicalDrive\" or action_file_path ~= \"^\\\\\\\\\\\\.\\\\\\\\Volume\\\\{\") and actor_effective_thumbprint = null and (actor_process_image_path ~= \"\\\\\\\\Users\\\\\\\\\" or actor_process_image_path ~= \"\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\\" or actor_process_image_path ~= \"\\\\\\\\ProgramData\\\\\\\\\" or actor_process_image_path ~= \"\\\\\\\\Users\\\\\\\\Public\\\\\\\\\") and actor_process_image_name not in (\"defrag.exe\",\"chkdsk.exe\",\"diskpart.exe\",\"fsutil.exe\",\"vds.exe\",\"vdsldr.exe\",\"vssvc.exe\",\"MsMpEng.exe\",\"MpCmdRun.exe\",\"drvinst.exe\",\"smartctl.exe\",\"WerFault.exe\")",
+      "_tightening_notes": [
+        "Five-way conjunction:",
+        "  1. file event is a write-intent open",
+        "  2. target path resolves to a kernel disk-class object",
+        "     (covers all Win32 syntaxes -- the kernel canonicalises)",
+        "  3. actor process is unsigned (effective_thumbprint = null)",
+        "  4. actor process lives in a user-writable directory",
+        "  5. actor process image name is not a known disk-tool",
+        "",
+        "An attacker has to defeat ALL five to evade. The most",
+        "achievable defeat is signing the binary -- which moves",
+        "the cost from 'free recompile' to 'acquire EV cert or",
+        "compromise a vendor cert', a materially harder ask."
+      ]
+    },
+
+    {
+      "name": "Petya-Class: Dropper CLI fingerprint",
+      "severity": "HIGH",
+      "category": "Petya-class MBR-locker prevention",
+      "behavior": "PREVENTION",
+      "query": "dataset = xdr_data | filter event_type = ENUM.PROCESS and event_sub_type = ENUM.PROCESS_START and action_process_image_command_line ~= \"(--install|--write-stage2|--backup-mbr|--restore-mbr|--bsod)\" and action_process_image_command_line ~= \"(--drive|PhysicalDrive|Device\\\\\\\\Harddisk|stage2\\\\.bin|mbr\\\\.bin)\" and actor_process_image_name in (\"explorer.exe\",\"powershell.exe\",\"pwsh.exe\",\"cmd.exe\",\"wmiprvse.exe\",\"cscript.exe\",\"wscript.exe\",\"firefox.exe\",\"chrome.exe\",\"msedge.exe\",\"outlook.exe\")",
+      "_tightening_notes": [
+        "Requires 2 independent CLI vocabularies AND an interactive",
+        "ancestor. A single CLI atom by itself (e.g., the word",
+        "'PhysicalDrive' in a log file) does not fire."
+      ]
+    },
+
+    {
+      "name": "Petya-Class: Known artifact filenames",
+      "severity": "MEDIUM",
+      "category": "Petya-class MBR-locker prevention",
+      "behavior": "PREVENTION",
+      "query": "dataset = xdr_data | filter event_type = ENUM.FILE and event_sub_type in (ENUM.FILE_CREATE_NEW, ENUM.FILE_RENAME) and action_file_name in (\"OpenPetya.exe\",\"stage2.bin\",\"mbr.bin\") and not action_file_path contains \"\\\\Backup\\\\\" and not action_file_path contains \"\\\\Quarantine\\\\\" and not action_file_path contains \"\\\\EDR-Sandbox\\\\\"",
+      "_tightening_notes": [
+        "Filename-based. Cheap. Defeated by rename. Pair with the",
+        "two rules above for real coverage."
+      ]
+    }
+  ]
+}

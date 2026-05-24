@@ -1,0 +1,80 @@
+// =====================================================================
+//  SentinelOne STAR (Storyline Active Response) -- Petya-class
+// =====================================================================
+//  Author:    Andrew Quill
+//  Created:   2026-05-24
+//  Modified:  2026-05-24
+//  Version:   2.0
+//  License:   Apache-2.0
+//  TLP:       TLP:CLEAR
+//  Reference: https://github.com/iss4cf0ng/OpenPetya
+//  MITRE:     T1561.002, T1485, T1490, T1529, T1134, T1542.003
+// =====================================================================
+//  STAR rules are S1QL queries with attached mitigation actions.
+//  Author in Console:
+//      Sentinels -> STAR Custom Rules -> Add
+//
+//  Mitigation actions available:
+//      Alert | Kill Process | Quarantine File | Disconnect from Network
+//      Remediate (rollback) | Custom Action Script
+//
+//  Adversarial-defeat notes
+//  ------------------------
+//  NAIVE v1: TgtFilePath contains "PhysicalDrive".
+//            Generic: matches log lines, AV scans, vendor strings.
+//            Operator adds exclusions; coverage erodes.
+//
+//  HARDENED v2 (below): conjunction of (raw disk handle to kernel
+//            disk object) AND (process not signed-and-verified) AND
+//            (process image path not in OS-signed paths) AND
+//            (process not in named imaging-vendor list).
+// =====================================================================
+
+
+// -----------------------------------------------------------------
+//  Rule 1 -- Petya-class dropper command-line fingerprint
+//  Mitigation: Kill Process + Quarantine File + Alert
+// -----------------------------------------------------------------
+EventType = "Process Creation"
+AND TgtProcCmdLine matches "(?i).*(--install|--write-stage2|--backup-mbr|--restore-mbr|--bsod).*"
+AND TgtProcCmdLine matches "(?i).*(--drive|PhysicalDrive|Device\\\\Harddisk|stage2\\.bin|mbr\\.bin).*"
+AND TgtProcImagePath matches "(?i)^[A-Z]:\\\\(Users|ProgramData|Windows\\\\Temp)\\\\.+"
+AND SrcProcImagePath matches "(?i).*\\\\(explorer|powershell|pwsh|cmd|wmiprvse|cscript|wscript|firefox|chrome|msedge|outlook|teams)\\.exe$"
+AND NOT TgtProcImagePath matches "(?i)^C:\\\\Program Files\\\\(Acronis|Veeam|Macrium|Veritas|CommVault|Cohesity|Rubrik)\\\\.+"
+| project TimeStamp, AgentName, TgtProcCmdLine, TgtProcImagePath, SrcProcImagePath
+
+
+// -----------------------------------------------------------------
+//  Rule 2 -- Raw-disk handle write by untrusted-signer process
+//  Mitigation: Kill Process + Alert
+// -----------------------------------------------------------------
+EventType IN ("File Creation", "File Modification")
+AND TgtFilePath matches "(?i)^(\\\\Device\\\\Harddisk|\\\\\\?\\\\PhysicalDrive|\\\\\\.\\\\PhysicalDrive|\\\\\\.\\\\Volume\\{|\\\\\\.\\\\GLOBALROOT\\\\Device\\\\Harddisk)"
+AND SrcProcVerifiedStatus != "verified"
+AND SrcProcPublisher NOT IN ("Microsoft Corporation","Microsoft Windows","Acronis International","Veeam Software","Macrium","CommVault","Veritas","Cohesity","Rubrik")
+AND NOT SrcProcImagePath matches "(?i)^C:\\\\Windows\\\\System32\\\\(defrag|chkdsk|diskpart|fsutil|vds|vdsldr|vssvc|drvinst|smartctl|MsMpEng|MpCmdRun|WerFault)\\.exe$"
+AND (SrcProcAgeDays < 7 OR SrcProcEnvironmentPrevalence < 5)
+| project TimeStamp, AgentName, TgtFilePath, SrcProcImagePath, SrcProcPublisher, SrcProcVerifiedStatus, SrcProcAgeDays, SrcProcEnvironmentPrevalence
+
+
+// -----------------------------------------------------------------
+//  Rule 3 -- Forced reboot following raw-disk write (compound)
+//  Mitigation: Alert + Disconnect from Network (PRESERVE STATE)
+// -----------------------------------------------------------------
+//  STAR supports sequencing via storyline correlation. Define this
+//  as a Compound rule with the two stages:
+EventType = "Process Creation"
+AND TgtProcName IN ("shutdown.exe","wininit.exe")
+AND PreviousStorylineEvent matches "RawDiskHandleWriteByUntrustedSigner"
+AND TimeBetweenEvents < 15m
+| project TimeStamp, AgentName, TgtProcName, TgtProcCmdLine, StorylineId
+
+
+// -----------------------------------------------------------------
+//  Rule 4 -- Artifact filename to disk (low-fidelity, cheap)
+//  Mitigation: Quarantine File + Alert
+// -----------------------------------------------------------------
+EventType = "File Creation"
+AND TgtFileName IN ("stage2.bin","mbr.bin","OpenPetya.exe")
+AND NOT TgtFilePath matches "(?i)^.+\\\\(Backup|Quarantine|EDR-Sandbox)\\\\.+"
+| project TimeStamp, AgentName, TgtFilePath, SrcProcImagePath

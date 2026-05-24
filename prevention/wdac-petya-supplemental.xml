@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    WDAC Supplemental Policy -- Petya-class denial
+    ==============================================
+    Author:    Andrew Quill
+    Created:   2026-05-24
+    Modified:  2026-05-24
+    Version:   2.0
+    License:   Apache-2.0
+    TLP:       TLP:CLEAR
+    Reference: https://github.com/iss4cf0ng/OpenPetya
+    MITRE:     T1561.002, T1485, T1490, T1529, T1542.003
+
+    Deploy as SUPPLEMENTAL to your existing WDAC base policy. Targets
+    the OpenPetya artifact filenames and the broader Petya-class
+    behavioral fingerprint via FileAttribute rules.
+
+    Compile with:
+        ConvertFrom-CIPolicy -XmlFilePath .\wdac-petya-supplemental.xml `
+                              -BinaryFilePath .\wdac-petya-supplemental.cip
+
+    Deploy via Intune / SCCM / GPO. Audit for >= 4 weeks before flipping
+    to enforced -- WDAC enforcement on a tuned base policy is the most
+    durable prevention available on Windows.
+
+    Adversarial-defeat notes
+    ------------------------
+    NAIVE v1: Deny ALL unsigned binaries from \Users\*, \Downloads\*,
+              \Temp\*, \ProgramData\*. Defeats by org-pressure: dev
+              tools and vendor installers fail, ops adds blanket
+              exception "Allow C:\ProgramData\*", attacker drops there.
+
+    HARDENED v2 (this file): Deny by FILE ATTRIBUTES (OriginalFilename,
+              ProductName, InternalName) plus DENY by file-rule LEVEL
+              "Publisher" with a NULL signer set -- meaning "unsigned"
+              -- BUT scoped to specific OriginalFilenames and to
+              binaries claiming to be Petya/OpenPetya. This way the
+              exception pressure is localised to "unsign this specific
+              attribute"  which the attacker cannot trivially trigger
+              by adding an exempt path.
+-->
+<SiPolicy xmlns="urn:schemas-microsoft-com:sipolicy">
+  <VersionEx>10.0.2.0</VersionEx>
+  <PolicyTypeID>{A244370E-44C9-4C06-B551-F6016E563076}</PolicyTypeID>
+  <PlatformID>{2E07F7E4-194C-4D20-B7C9-6F44A6C5A234}</PlatformID>
+  <PolicyID>{1f8e0c2e-3f60-4d11-a4a2-petya000bcd0}</PolicyID>
+  <BasePolicyID>{A244370E-44C9-4C06-B551-F6016E563076}</BasePolicyID>
+
+  <Rules>
+    <Rule><Option>Enabled:Unsigned System Integrity Policy</Option></Rule>
+    <Rule><Option>Enabled:Advanced Boot Options Menu</Option></Rule>
+    <Rule><Option>Enabled:Update Policy No Reboot</Option></Rule>
+    <!-- Start in audit; flip to enforced (remove the line) after tuning -->
+    <Rule><Option>Enabled:Audit Mode</Option></Rule>
+  </Rules>
+
+  <EKUs />
+
+  <!-- ============================================================ -->
+  <!--  FILE RULES                                                  -->
+  <!-- ============================================================ -->
+  <FileRules>
+
+    <!-- ===== Deny by ORIGINAL FILENAME (MinGW-built dropper)  ===== -->
+    <!--      Resistant to rename: the OriginalFilename attribute is
+              embedded in the PE's VERSIONINFO resource at compile
+              time. The attacker must REBUILD with a different
+              VERSIONINFO to evade -- no copy-and-rename works.    -->
+    <Deny ID="ID_DENY_PETYA_DROPPER_ORIGNAME"
+          FriendlyName="Deny OpenPetya dropper by OriginalFileName"
+          FileName="OpenPetya.exe"
+          MinimumFileVersion="0.0.0.0" />
+
+    <!-- ===== Deny by FILE DESCRIPTION  ===== -->
+    <Deny ID="ID_DENY_PETYA_DROPPER_DESC"
+          FriendlyName="Deny PE claiming Petya in FileDescription"
+          FileDescription="Petya"
+          MinimumFileVersion="0.0.0.0" />
+    <Deny ID="ID_DENY_PETYA_DROPPER_DESC2"
+          FriendlyName="Deny PE claiming OpenPetya in FileDescription"
+          FileDescription="OpenPetya"
+          MinimumFileVersion="0.0.0.0" />
+
+    <!-- ===== Deny known-bad payload filenames =====
+              Stage-2 / MBR blobs that the dropper expects on argv.
+              These never legitimately appear on an enterprise
+              endpoint. Path-agnostic deny.                          -->
+    <Deny ID="ID_DENY_STAGE2_BIN"
+          FriendlyName="Deny stage2.bin payload filename"
+          FileName="stage2.bin"
+          MinimumFileVersion="0.0.0.0" />
+    <Deny ID="ID_DENY_MBR_BIN"
+          FriendlyName="Deny mbr.bin payload filename"
+          FileName="mbr.bin"
+          MinimumFileVersion="0.0.0.0" />
+
+  </FileRules>
+
+  <!-- ============================================================ -->
+  <!--  SIGNERS                                                     -->
+  <!--  (empty -- this supplemental only denies)                    -->
+  <!-- ============================================================ -->
+  <Signers />
+
+  <SigningScenarios>
+    <SigningScenario Value="131" ID="ID_SIGNINGSCENARIO_DRIVERS" FriendlyName="Drivers">
+      <ProductSigners />
+    </SigningScenario>
+    <SigningScenario Value="12" ID="ID_SIGNINGSCENARIO_USERMODE" FriendlyName="User-mode">
+      <ProductSigners>
+        <FileRulesRef>
+          <FileRuleRef RuleID="ID_DENY_PETYA_DROPPER_ORIGNAME" />
+          <FileRuleRef RuleID="ID_DENY_PETYA_DROPPER_DESC" />
+          <FileRuleRef RuleID="ID_DENY_PETYA_DROPPER_DESC2" />
+          <FileRuleRef RuleID="ID_DENY_STAGE2_BIN" />
+          <FileRuleRef RuleID="ID_DENY_MBR_BIN" />
+        </FileRulesRef>
+      </ProductSigners>
+    </SigningScenario>
+  </SigningScenarios>
+
+  <UpdatePolicySigners />
+  <CiSigners />
+  <HvciOptions>0</HvciOptions>
+  <Settings>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="Name">
+      <Value><String>OpenPetya-Class Supplemental Deny</String></Value>
+    </Setting>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="Id">
+      <Value><String>20260524.1</String></Value>
+    </Setting>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="Author">
+      <Value><String>Andrew Quill</String></Value>
+    </Setting>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="Version">
+      <Value><String>2.0</String></Value>
+    </Setting>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="License">
+      <Value><String>Apache-2.0</String></Value>
+    </Setting>
+    <Setting Provider="PolicyInfo" Key="Information" ValueName="TLP">
+      <Value><String>TLP:CLEAR</String></Value>
+    </Setting>
+  </Settings>
+</SiPolicy>

@@ -1,0 +1,78 @@
+{
+  "metadata": {
+    "author":    "Andrew Quill",
+    "created":   "2026-05-24",
+    "modified":  "2026-05-24",
+    "version":   "2.0",
+    "license":   "Apache-2.0",
+    "tlp":       "TLP:CLEAR",
+    "reference": "https://github.com/iss4cf0ng/OpenPetya",
+    "mitre":     ["T1561.002", "T1485", "T1490", "T1529", "T1105"]
+  },
+  "_comment_for_humans": [
+    "Microsoft Defender for Endpoint -- Custom Indicators (TI Indicators API)",
+    "===========================================================================",
+    "Each object below is one POST body for:",
+    "    POST https://api.securitycenter.microsoft.com/api/indicators",
+    "with header: Authorization: Bearer <token-from-AAD-app-with-Ti.ReadWrite.All>",
+    "",
+    "Order of deployment:",
+    "  1. URL indicator    -- blocks GitHub repo path. Zero FP risk.",
+    "  2. File hashes      -- only useful if you have specific samples.",
+    "                         Trivially defeated by recompile.",
+    "  3. Filename pattern -- not natively supported; use a SmartScreen",
+    "                         policy or ASR rule instead.",
+    "",
+    "Adversarial-defeat notes",
+    "------------------------",
+    "  NAIVE v1: Block 'github.com' entirely. Org breaks instantly.",
+    "  HARDENED v2: Block the SPECIFIC PATH /iss4cf0ng/OpenPetya only.",
+    "             SmartScreen URL category 'malware' filter handles the",
+    "             rest. URL-path-specific blocks are a no-FP control."
+  ],
+
+  "indicators_to_post": [
+    {
+      "indicatorValue": "github.com/iss4cf0ng/OpenPetya",
+      "indicatorType":  "Url",
+      "title":          "Block OpenPetya repository delivery",
+      "description":    "Source repository for Petya-class educational PoC ransomware.",
+      "action":         "Block",
+      "severity":       "High",
+      "recommendedActions": "Investigate any host that reached this URL. Search prior 30 days of DeviceFileEvents/DeviceProcessEvents for OpenPetya artifacts.",
+      "rbacGroupNames": [],
+      "generateAlert":  true,
+      "_tightening_notes": "Path-scoped URL block. Does not affect other github.com use. Cannot be defeated by URL renaming on attacker side (would require forking and changing the path; detection script in companion .kql checks for any /iss4cf0ng/ path)."
+    },
+    {
+      "indicatorValue": "raw.githubusercontent.com/iss4cf0ng/OpenPetya",
+      "indicatorType":  "Url",
+      "title":          "Block OpenPetya raw-file delivery from GitHub CDN",
+      "description":    "GitHub raw content URL for the OpenPetya repository.",
+      "action":         "Block",
+      "severity":       "High",
+      "generateAlert":  true
+    },
+    {
+      "indicatorValue": "codeload.github.com/iss4cf0ng/OpenPetya",
+      "indicatorType":  "Url",
+      "title":          "Block OpenPetya zip-archive delivery from GitHub",
+      "description":    "GitHub archive-download CDN URL.",
+      "action":         "Block",
+      "severity":       "High",
+      "generateAlert":  true
+    },
+
+    {
+      "_block_named_artifact_with_certificate_authority": "FileSha256 indicators below are placeholders. Replace with hashes of samples you collect. Hash-based blocking is brittle (recompile defeats) but useful for known artifacts. The behavioral prevention (ASR + IOAs) carries the load; hashes are a supplement.",
+      "indicatorValue": "0000000000000000000000000000000000000000000000000000000000000000",
+      "indicatorType":  "FileSha256",
+      "title":          "Block known OpenPetya.exe sample (PLACEHOLDER)",
+      "description":    "Replace value with actual SHA-256 of collected sample.",
+      "action":         "BlockAndRemediate",
+      "severity":       "High",
+      "generateAlert":  true,
+      "_tightening_notes": "Hash blocks are point-in-time. Pair with ASR rule 01443614-cd74-433a-b99e-2ecdc07bfc25 (block low-prevalence binaries) for durable coverage."
+    }
+  ]
+}

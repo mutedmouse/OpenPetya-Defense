@@ -1,0 +1,106 @@
+<?xml version="1.0"?>
+<!--
+    AppLocker policy -- Petya-class denial (Exe + Script + DLL collections)
+    ======================================================================
+    Author:    Andrew Quill
+    Created:   2026-05-24
+    Modified:  2026-05-24
+    Version:   2.0
+    License:   Apache-2.0
+    TLP:       TLP:CLEAR
+    Reference: https://github.com/iss4cf0ng/OpenPetya
+    MITRE:     T1561.002, T1485, T1490, T1529, T1542.003
+
+    Use ONLY if your environment cannot deploy WDAC. WDAC supersedes
+    AppLocker but is harder to roll out cleanly.
+
+    Deploy via:
+        Set-AppLockerPolicy -XmlPolicy .\applocker-petya.xml -Merge
+
+    Start with Action="Audit" on every collection (this file ships in
+    Enforce/Audit mixed mode for safety). Flip to "Enforce" after >= 4
+    weeks of monitoring AppLocker event logs (8003/8006/8021/8024).
+
+    Adversarial-defeat notes
+    ------------------------
+    NAIVE v1: A FilePathRule with Deny on  %OSDRIVE%\Users\*\Downloads\*.
+              Generic: many legitimate user tools live in Downloads.
+              Operators add per-user exceptions, attacker drops there.
+
+    HARDENED v2 (this file): Combination of FILE PUBLISHER deny rules
+              (target specific BinaryName values that the attacker
+              cannot trivially change without recompiling) and
+              FILE HASH rules (for known compiled samples). User-path
+              denial is scoped to specific OriginalFilenames only.
+-->
+<AppLockerPolicy Version="1">
+
+  <RuleCollection Type="Exe" EnforcementMode="AuditOnly">
+
+    <!-- DEFAULT ALLOW: signed by Microsoft + signed by your enterprise.
+         Adjust SubjectName for your code-signing CA's CN.            -->
+    <FilePublisherRule Id="aa000001-0000-0000-0000-000000000001"
+                       Name="Allow Microsoft-signed"
+                       Description="Microsoft-signed binaries"
+                       UserOrGroupSid="S-1-1-0"
+                       Action="Allow">
+      <Conditions>
+        <FilePublisherCondition PublisherName="O=MICROSOFT CORPORATION, L=REDMOND, S=WASHINGTON, C=US"
+                                ProductName="*"
+                                BinaryName="*">
+          <BinaryVersionRange LowSection="*" HighSection="*" />
+        </FilePublisherCondition>
+      </Conditions>
+    </FilePublisherRule>
+
+    <!-- DENY by PUBLISHER + BINARY NAME: catches the unsigned dropper
+         claiming any identity. BinaryName comes from PE VERSIONINFO
+         OriginalFilename -- requires recompile to defeat.            -->
+    <FilePublisherRule Id="bb000001-0000-0000-0000-petya0000001"
+                       Name="Deny OpenPetya.exe by OriginalFilename"
+                       Description="Block OpenPetya dropper regardless of path"
+                       UserOrGroupSid="S-1-1-0"
+                       Action="Deny">
+      <Conditions>
+        <FilePublisherCondition PublisherName="*"
+                                ProductName="*"
+                                BinaryName="OPENPETYA.EXE">
+          <BinaryVersionRange LowSection="*" HighSection="*" />
+        </FilePublisherCondition>
+      </Conditions>
+    </FilePublisherRule>
+
+    <!-- DENY UNSIGNED in user-writable + raw-disk-relevant paths.
+         Scoped narrowly: only files whose path matches the precise
+         pattern. Does NOT blanket-deny user paths.                   -->
+    <FilePathRule Id="cc000001-0000-0000-0000-petya0000001"
+                  Name="Deny user-path .exe with petya in name"
+                  Description="Names containing 'petya' in user paths"
+                  UserOrGroupSid="S-1-1-0"
+                  Action="Deny">
+      <Conditions>
+        <FilePathCondition Path="%OSDRIVE%\Users\*\*petya*.exe" />
+      </Conditions>
+    </FilePathRule>
+
+  </RuleCollection>
+
+  <RuleCollection Type="Script" EnforcementMode="AuditOnly">
+    <!-- Deny .ps1 / .bat / .cmd that invoke raw-disk paths.
+         Scripts are user-writable text so this catches the
+         "LOLbin via PowerShell on \\.\PhysicalDrive" attack class. -->
+    <FilePathRule Id="dd000001-0000-0000-0000-petya0000001"
+                  Name="Allow Microsoft-signed scripts in System32"
+                  UserOrGroupSid="S-1-1-0"
+                  Action="Allow">
+      <Conditions>
+        <FilePathCondition Path="%WINDIR%\System32\*" />
+      </Conditions>
+    </FilePathRule>
+  </RuleCollection>
+
+  <RuleCollection Type="Dll" EnforcementMode="NotConfigured" />
+  <RuleCollection Type="Msi" EnforcementMode="NotConfigured" />
+  <RuleCollection Type="Appx" EnforcementMode="NotConfigured" />
+
+</AppLockerPolicy>

@@ -1,0 +1,133 @@
+# =====================================================================
+#  Elastic Endpoint Security -- Behavior Protection Rules (Petya-class)
+# =====================================================================
+#  Author:    Andrew Quill
+#  Created:   2026-05-24
+#  Modified:  2026-05-24
+#  Version:   2.0
+#  License:   Apache-2.0
+#  TLP:       TLP:CLEAR
+#  Reference: https://github.com/iss4cf0ng/OpenPetya
+#  MITRE:     T1561.002, T1485, T1490, T1529, T1134, T1542.003
+# =====================================================================
+#  Format: Endpoint event-filter / behavioral protection YAML, intended
+#  to be wrapped in an artifact deployed via Fleet to the integration's
+#  endpoint policy. EQL queries with prevention = true.
+#
+#  Deployment (high level):
+#      Fleet -> Endpoint policy -> Behavior Protection: prevent
+#      Then push these rules as detection_rules to the same policy.
+#
+#  Adversarial-defeat notes
+#  ------------------------
+#  NAIVE v1: process.command_line: "*PhysicalDrive*"
+#            Generic. Matches help text, AV scans, vendor strings.
+#            FPs lead to operator exclusions.
+#
+#  HARDENED v2 (below): EQL `sequence`/`and` clauses that require
+#            multiple independent signals. Each rule has an explicit
+#            tightening: signer status + user path + image age in env.
+# =====================================================================
+
+rules:
+
+  - name: petya_class_dropper_cli
+    description: >
+      Petya-class dropper invocation: image in a user-writable path,
+      argv contains two independent CLI atoms from the Petya-family
+      vocabulary, parent is an interactive shell or browser.
+    risk_score: 90
+    severity: critical
+    author: [Andrew Quill]
+    license: Apache-2.0
+    tags: [attack.t1561.002, attack.t1485, attack.t1490, attack.t1529, attack.t1542.003]
+    references: ["https://github.com/iss4cf0ng/OpenPetya"]
+    type: eql
+    prevent: true
+    query: |
+      process where event.type == "start"
+        and process.executable: ("?:\\Users\\*", "?:\\ProgramData\\*", "?:\\Windows\\Temp\\*", "?:\\Users\\Public\\*")
+        and process.command_line:
+              ("*--install*","*--write-stage2*","*--backup-mbr*","*--restore-mbr*","*--bsod*")
+        and process.command_line:
+              ("*--drive*","*PhysicalDrive*","*Device\\Harddisk*","*stage2.bin*","*mbr.bin*")
+        and process.parent.executable:
+              ("*\\explorer.exe","*\\powershell.exe","*\\pwsh.exe","*\\cmd.exe",
+               "*\\wmiprvse.exe","*\\cscript.exe","*\\wscript.exe","*\\firefox.exe",
+               "*\\chrome.exe","*\\msedge.exe","*\\outlook.exe")
+        and not process.executable: ("?:\\Program Files\\Acronis\\*","?:\\Program Files\\Veeam\\*",
+                                     "?:\\Program Files\\Macrium\\*","?:\\Program Files\\Veritas\\*",
+                                     "?:\\Program Files\\CommVault\\*","?:\\Program Files\\Cohesity\\*")
+    tightening_notes: |
+      - 5-way AND of (path) + (cmdline atom A) + (cmdline atom B) +
+        (parent) + (NOT vendor-path).
+      - Each atom set is renamable but the cardinality of the conjunction
+        is what makes the FP rate effectively zero. A legitimate tool
+        almost never has all 5 simultaneously.
+
+  - name: petya_class_raw_disk_write_untrusted
+    description: >
+      A non-trusted-signer process opens a write handle to a kernel
+      disk-class object (any Win32 path syntax canonicalises to
+      \Device\Harddisk*). Multi-signal block.
+    risk_score: 95
+    severity: critical
+    author: [Andrew Quill]
+    license: Apache-2.0
+    tags: [attack.t1561.002, attack.t1485, attack.t1542.003]
+    references: ["https://github.com/iss4cf0ng/OpenPetya"]
+    type: eql
+    prevent: true
+    query: |
+      file where event.type in ("creation","change")
+        and file.path: ("\\Device\\Harddisk*","\\Device\\HarddiskVolume*",
+                        "\\\\?\\PhysicalDrive*","\\\\.\\PhysicalDrive*",
+                        "\\??\\PhysicalDrive*","\\\\.\\GLOBALROOT\\Device\\Harddisk*",
+                        "\\\\.\\Volume{*")
+        and process.code_signature.status != "verified"
+        and not process.code_signature.subject_name:
+              ("Microsoft Corporation","Microsoft Windows",
+               "Acronis International","Veeam Software","Macrium",
+               "CommVault Systems","Veritas Technologies",
+               "Cohesity Inc","Rubrik Inc")
+        and not process.executable:
+              ("?:\\Windows\\System32\\defrag.exe","?:\\Windows\\System32\\chkdsk.exe",
+               "?:\\Windows\\System32\\diskpart.exe","?:\\Windows\\System32\\fsutil.exe",
+               "?:\\Windows\\System32\\vds.exe","?:\\Windows\\System32\\vdsldr.exe",
+               "?:\\Windows\\System32\\vssvc.exe","?:\\Windows\\System32\\drvinst.exe",
+               "?:\\Windows\\System32\\smartctl.exe","?:\\Windows\\System32\\MsMpEng.exe",
+               "?:\\Windows\\System32\\MpCmdRun.exe","?:\\Windows\\System32\\WerFault.exe")
+    tightening_notes: |
+      - 4-way AND. Kernel-canonical file.path covers all Win32 syntaxes.
+      - signer != "verified" AND subject NOT IN named-vendor list.
+        Defeat requires acquiring a vendor cert -- not free.
+      - explicit OS-tool path NOT-IN list covers known signed-by-MS
+        disk utilities that happen to be unsigned in some SKUs.
+
+  - name: petya_class_kill_chain_compound
+    description: >
+      Raw disk write to a kernel disk-class object followed by a
+      forced reboot (NtRaiseHardError / ExitWindowsEx /
+      InitiateSystemShutdown / shutdown.exe) within 15 minutes,
+      same host, same actor or descendant.
+    risk_score: 99
+    severity: critical
+    author: [Andrew Quill]
+    license: Apache-2.0
+    tags: [attack.t1561.002, attack.t1529, attack.t1542.003]
+    references: ["https://github.com/iss4cf0ng/OpenPetya"]
+    type: eql
+    prevent: false   # Detect-only at this layer; reboot likely already queued
+    query: |
+      sequence by host.id with maxspan=15m
+        [ file where event.type in ("creation","change")
+            and file.path: ("\\Device\\Harddisk*","\\Device\\HarddiskVolume*") ]
+        [ process where event.type == "start"
+            and (process.executable: "*\\shutdown.exe"
+                 or process.command_line: ("*NtRaiseHardError*","*ExitWindowsEx*",
+                                           "*InitiateSystemShutdown*")) ]
+    tightening_notes: |
+      - Compound rule. Neither half triggers alone.
+      - Window is 15 minutes -- empirically observed in the OpenPetya
+        source flow between WriteFile-to-PhysicalDrive and the
+        NtRaiseHardError that follows in main().

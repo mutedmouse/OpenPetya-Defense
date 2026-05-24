@@ -1,0 +1,171 @@
+================================================================
+ CrowdStrike Falcon -- Custom IOA Prevention Rules (Petya-class)
+================================================================
+ Author:    Andrew Quill
+ Created:   2026-05-24
+ Modified:  2026-05-24
+ Version:   2.0
+ License:   Apache-2.0
+ TLP:       TLP:CLEAR
+ Reference: https://github.com/iss4cf0ng/OpenPetya
+ MITRE:     T1561.002, T1485, T1490, T1529, T1134, T1542.003
+================================================================
+
+Format
+------
+IOA rules in CrowdStrike are authored in Falcon Console under:
+    Configuration -> Custom IOA Rule Groups
+Each rule has:
+    Rule Type           : ProcessCreation | FileCreation | NetworkConnection | ImageHash
+    Action              : Monitor | Detect | Block Execution | Block + Kill
+    Severity            : Informational | Low | Medium | High | Critical
+    Pattern Severity    : (same scale)
+    Disposition         : Define MITRE technique
+    Conditions          : regex patterns over ImageFileName, CommandLine,
+                          ParentImageFileName, TargetFile, etc.
+
+The pseudo-syntax below mirrors what you enter in the rule editor.
+Replace ~~~~~~~~~ with your enterprise vendor allowlist values.
+
+Deployment
+----------
+  1. Create RuleGroup "Petya-Class-Prevention" in Monitor mode.
+  2. Add rules below.
+  3. Observe for 2 weeks; tune allowlist regex.
+  4. Promote to "Block + Kill" once FP-clean.
+
+Adversarial-defeat notes (read FIRST, then read rules)
+------------------------------------------------------
+  NAIVE v1: Block any process whose command-line contains "PhysicalDrive".
+            Generic: matches help-strings, log scans, AV scans of source,
+            backup tools that print their target. Operator adds exclusions
+            that erode coverage.
+
+  HARDENED v2 (below): Block on process CREATION combined with parent
+            image (un-trusted), image path (user-writable), AND argv
+            shape (multi-token disk-tool fingerprint). The conjunction
+            is rare enough that no exclusion is needed.
+
+  NAIVE v1: Block any process opening \\.\PhysicalDrive*.
+            Generic: blocks Falcon's own sensor, Volume Shadow Copy,
+            backup agents, defrag. Operator allowlists "Backup Vendor X",
+            attacker drops binary into Backup-Vendor-X's installation
+            path or DLL-sideloads into the vendor's signed process.
+
+  HARDENED v2 (below): Block on raw-disk handle open combined with
+            (a) image_signer NOT-IN known good, (b) image_path NOT-IN
+            OS-signed paths, (c) image_age < 7 days OR image_prevalence
+            in tenant < 5 hosts. The conjunction matches malware
+            behavior; legitimate vendor agents satisfy at least one of
+            (a)/(b)/(c) and are not blocked.
+
+
+================================================================
+ Rule 1 -- Petya-class dropper EXECUTION (Process Creation)
+================================================================
+RuleGroup       : Petya-Class-Prevention
+Rule Type       : Process Creation
+Severity        : Critical
+Disposition     : T1561.002 / T1485 / T1490 / T1529
+Action          : Block Execution and Notify
+Description     : User-writable image launching with Petya-family CLI
+                  fingerprint. Multi-token argv match makes this near-
+                  impossible to false-positive on.
+
+Conditions (logical AND across all):
+  ImageFileName             matches  .*\.(exe|com|scr)$
+  GrandparentImageFileName  matches  .*\\(explorer|powershell|pwsh|cmd|wmiprvse|cscript|wscript|firefox|chrome|msedge|outlook|teams)\.exe$
+  ImageFileName             matches  ^[A-Z]:\\(Users|ProgramData|Windows\\Temp|Temp)\\.+
+  CommandLine               matches  .*(--install|--write-stage2|--backup-mbr|--restore-mbr|--bsod).*
+  CommandLine               matches  .*(--drive|PhysicalDrive|Device\\Harddisk|stage2\.bin|mbr\.bin).*
+
+  # Exclusion: known good imaging vendors (regex anchors on full path)
+  ImageFileName             NOT matches  ^C:\\Program Files\\(Acronis|Veeam|Macrium|Veritas|CommVault|Cohesity|Rubrik)\\.+
+  ImageFileName             NOT matches  ^C:\\Windows\\System32\\.+
+
+Tightening
+  - Requires 2 of the CLI-vocabulary group plus 1 of the path/argument
+    group -- a SINGLE word like "PhysicalDrive" is not sufficient.
+  - GrandparentImageFileName check prevents service-host-installed
+    legitimate tools from matching (those are launched by SCM, not by
+    an interactive shell ancestor).
+
+
+================================================================
+ Rule 2 -- Raw-disk handle open by untrusted image (FileOp)
+================================================================
+RuleGroup       : Petya-Class-Prevention
+Rule Type       : File System Operation
+Sub-Type        : Open (write-intent)
+Severity        : Critical
+Action          : Block + Kill
+Description     : Multi-signal block of raw disk handle opens.
+                  Conjunction: (target is disk-class kernel object)
+                  AND (image not signed by known publisher) AND
+                  (image not in OS-signed path) AND (image is young
+                  in environment).
+
+Conditions (logical AND):
+  TargetFileName       matches      ^(\\Device\\Harddisk|\\??\\PhysicalDrive|\\\\\.\\PhysicalDrive|\\\\\.\\Volume\{|\\\\\.\\GLOBALROOT\\Device\\Harddisk)
+  FileOpenIntent       equals       Write
+  ImageSignerStatus    NOT equals   Verified
+  ImageSubjectCN       NOT IN       [Microsoft Corporation, Microsoft Windows, ~your_org_CN~, Acronis International, Veeam Software, Macrium, CommVault, Veritas, Cohesity, Rubrik]
+  ImageFileName        NOT matches  ^C:\\Windows\\System32\\(defrag|chkdsk|diskpart|fsutil|vds|vdsldr|vssvc|drvinst|smartctl|MsMpEng|MpCmdRun|WerFault)\.exe$
+  ImageFirstSeenAgeDays  <  7  OR  ImagePrevalenceInTenant  <  5
+
+Tightening (vs NAIVE single-signal v1):
+  - 5 ANDed conditions. The attacker needs to satisfy ALL exemptions
+    simultaneously: get a trusted-signer signature, drop into an OS
+    path, AND be aged into prevalence. Realistic only via a vendor
+    supply-chain compromise.
+  - "NOT IN named-vendor-CN list" is more precise than "NOT IN signed
+    paths" -- attacker can drop into a vendor's INSTALLATION path
+    but cannot easily sign their binary with the vendor's CERT.
+
+
+================================================================
+ Rule 3 -- Forced reboot AFTER raw-disk write (CompoundAction)
+================================================================
+RuleGroup       : Petya-Class-Prevention
+Rule Type       : Compound (Process Creation triggered by File System)
+Severity        : Critical
+Action          : Detect (Block at this layer is too risky -- the
+                  reboot may already be queued)
+Description     : Within 15 minutes of a process performing
+                  raw-disk-write per Rule 2, the same process or its
+                  descendants triggers a forced reboot. This is the
+                  Petya-class kill-chain proper.
+
+Conditions:
+  preceding event : Rule 2 fired (raw disk write block / detect)
+  current event   : Process Creation OR API call where:
+        process_name in [shutdown.exe, wininit.exe trigger,
+                          NtRaiseHardError invocation, ExitWindowsEx,
+                          InitiateSystemShutdown*]
+  same_aid        : true
+  time_window     : <= 15 minutes
+
+Tightening:
+  - Compound rule -- single events do not trigger. Bare shutdown.exe
+    by itself is daily ops; bare raw disk write may be backup. The
+    PAIR is Petya-class.
+
+
+================================================================
+ Rule 4 -- Known artifact filenames written to disk
+================================================================
+RuleGroup       : Petya-Class-Prevention
+Rule Type       : File Write
+Severity        : High
+Action          : Block + Notify
+Description     : Filename-only block. Cheap but easy to defeat by rename.
+                  Useful as a cheap, FP-clean catch for the unmodified
+                  PoC.
+
+Conditions:
+  TargetFileName matches  .*\\(stage2\.bin|mbr\.bin|OpenPetya\.exe)$
+  TargetFileName NOT matches  .*\\(Backup|Quarantine|EDR-Sandbox)\\.*
+
+Tightening:
+  - Path-suffix exclusion for legitimate IR/backup paths.
+  - Pair with hash-based blocks for known compiled samples.
